@@ -55,6 +55,7 @@ init([]) ->
             , ?CHILD(achlys_task_server, worker)
             , ?CHILD(achlys_task_worker, worker)
             , ?CHILD(achlys_pmod_worker_sup, supervisor)
+            , ?CHILD(achlys_pmod_temp_worker, worker)
         ]}
     }.
 

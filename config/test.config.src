@@ -14,6 +14,11 @@
             cleaning => true
         }
     },
+    {temperature_worker, #{
+                    poll_interval => 6000,
+                    aggregation_trigger => 3
+                }
+    },
     {initial_tasks, venom},
     {streamers,  #{
         achlys_pmod_nav_worker => #{

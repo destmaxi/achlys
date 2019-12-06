@@ -53,6 +53,7 @@
 
 -define(NAV_WORKER , ?CHILD(achlys_pmod_nav_worker, worker)).
 -define(ALS_WORKER , ?CHILD(achlys_pmod_als_worker, worker)).
+-define(TEMP_WORKER , ?CHILD(achlys_pmod_temp_worker, worker)).
 -define(SENSOR_COMMANDER , ?CHILD(achlys_sensor_commander, worker)).
 
 -define(STREAMERS, #{achlys_pmod_nav_worker => ?NAV_WORKER
