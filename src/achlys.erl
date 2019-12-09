@@ -92,6 +92,8 @@
 -export([gc/0]).
 -export([flush/1]).
 -export([join_host/1]).
+-export([t/0]).
+-export([ta/0]).
 
 
 %%====================================================================
@@ -274,6 +276,14 @@ bane_all_preys(Data) ->
 -spec venom() -> ok.
 venom() ->
     achlys_pmod_nav_worker:run().
+
+t() ->
+    achlys_pmod_temp_worker:run().
+
+ta() ->
+  fun() ->
+    achlys_pmod_temp_worker:run()
+  end.
 
 %% @doc Collect data based on sensors available on Pmod modules and store
 %% aggregated values in corresponding Lasp variable.

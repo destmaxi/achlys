@@ -56,7 +56,8 @@
 
 -record(state, {
   measures :: map(),
-  round :: pos_integer()
+  round :: pos_integer(),
+  cardinality :: pos_integer()
 }).
 
 -type state() :: #state{}.
@@ -80,9 +81,7 @@ start_link() ->
 %% and sets triggers for handlers after intervals have expired.
 -spec run() -> ok.
 run() ->
-  F = fun() ->
-    gen_server:cast(?SERVER, run)
-      end.
+  gen_server:cast(?SERVER, run).
 
 
 %%====================================================================
@@ -97,7 +96,8 @@ init([]) ->
   % erlang:send_after(?TEN, ?SERVER, run),
   {ok, #state{
     measures = MeasuresParameter,
-    round = 0}}.
+    round = 0,
+    cardinality = 2}}.
 
 
 %%--------------------------------------------------------------------
@@ -109,13 +109,11 @@ handle_call(_Request, _From, State) ->
 %%--------------------------------------------------------------------
 
 % @private
-handle_cast(run , State) ->
-  io:fwrite("Declared CRDTs for global round ~n"),
+handle_cast(run, State) ->
   logger:log(notice, "Declared CRDTs for global round ~n"),
 
   {ok, {Id, _, _, _}} = lasp:declare({erlang:atom_to_binary(temperature_worker_counter, utf8)
     , state_max_int}, state_max_int),
-  io:fwrite("id: ~p~n", [Id]),
 
   IntermediateState = mapz:deep_put([global_round], Id, State#state.measures),
 
@@ -167,39 +165,59 @@ handle_info(poll, State) ->
 
 
 %%--------------------------------------------------------------------
-
 handle_info(aggregate, State) ->
+  io:fwrite("Start ~p ~n", [1]),
   #{global_round := GR
     , table := T
     , poll_interval := P
     , aggregation_trigger := A} = State#state.measures,
-  {ok, GCounter} = lasp:query(GR),
-  NewRound = if GCounter == State#state.round ->
-    {ok, _} = lasp:update(GR, increment, self()),
-    State#state.round + 1;
-               true -> GCounter
-             end,
-  {ok, GCounter2} = lasp:query(GR),
-  io:fwrite("gr: ~p ~n", [GCounter2]),
+  NewRound = update_counter(GR, State),
+  io:fwrite("Round ~p ~n", [NewRound]),
   Len = ets:info(temperature, size),
   _ = case Len >= A of
         true ->
           {_Sample, Mean} = get_mean(temperature),
-          io:fwrite("with: ~p~n", [{node(), erlang:round(Mean)}]),
           SetId = get_variable_identifier(NewRound),
           {ok, {Id, _, _, _}} = lasp:declare({SetId
             , state_awset}, state_awset),
-          io:fwrite("id: ~p~n", [Id]),
           {ok, {C2, _, _, _}} = lasp:update(
             Id,
             {add, {node(), erlang:round(Mean)}},
-            self());
+            self()),
+          wait_for_data(State#state.cardinality, C2, NewRound);
         _ ->
           logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len])
       end,
-  erlang:send_after((P * A), ?SERVER, aggregate),
   ok = achlys_cleaner:flush_table(T),
+
+  erlang:send_after((P * A), ?SERVER, aggregate),
+
+  io:fwrite("End ~p ~n", [1]),
+
   {noreply, State#state{round = NewRound}};
+
+handle_info({analyse, Round, Id}, State) ->
+  io:fwrite("Statrt ~p ~n", [2]),
+  {ok, S} = lasp:query(Id),
+  Fetched = sets:to_list(S),
+  io:fwrite("Cardinality: ~p ~n", [{Round, State#state.cardinality}]),
+  io:fwrite("Data: ~p ~n", [Fetched]),
+  io:fwrite("End ~p ~n", [2]),
+  {noreply, State};
+
+
+
+handle_info({increment_cardinality, NewCardinality}, State) when NewCardinality > State#state.cardinality ->
+  {noreply, State#state{cardinality = NewCardinality}};
+
+handle_info({increment_cardinality, _}, State) ->
+  {noreply, State};
+
+handle_info({decrement_cardinality, NewCardinality}, State) when NewCardinality < State#state.cardinality ->
+  {noreply, State#state{cardinality = NewCardinality}};
+
+handle_info({decrement_cardinality, _}, State) ->
+  {noreply, State};
 
 
 handle_info(Info, State) ->
@@ -284,6 +302,54 @@ is_pmod_nav_alive() ->
   end.
 
 
-get_variable_identifier(Number) ->
+get_variable_identifier(Round) ->
   unicode:characters_to_binary([erlang:atom_to_binary(temperature_worker, utf8), "_",
-    list_to_binary(integer_to_list(Number))], utf8).
+    list_to_binary(integer_to_list(Round))], utf8).
+
+update_counter(GR, State) ->
+  {ok, GCounter} = lasp:query(GR),
+  if GCounter == State#state.round ->
+    {ok, _} = lasp:update(GR, increment, self()),
+    State#state.round + 1;
+    true -> GCounter
+  end.
+
+
+wait_for_data(Cardinality, Id, Round) ->
+  spawn(fun() ->
+    Self = self(),
+    _Pid = spawn(fun() ->
+      lasp:read(Id, {cardinality, Cardinality}),
+      Self ! {self(), ok} end),
+    receive
+      {_Pid, ok} ->
+        try_increase_cardinality(Cardinality, Id),
+        erlang:send(?SERVER, {analyse, Round, Id}),
+        ok
+    after
+      40000 ->
+        erlang:send(?SERVER, {decrement_cardinality, Cardinality - 1}),
+        erlang:send(?SERVER, {analyse, Round, Id}),
+        ok
+    end,
+    exit(terminated)
+        end),
+  ok.
+
+try_increase_cardinality(Cardinality, Id) ->
+  spawn(fun() ->
+    Self = self(),
+    _Pid = spawn(fun() ->
+      lasp:read(Id, {cardinality, Cardinality + 1}),
+      Self ! {self(), ok} end),
+    receive
+      {_Pid, ok} ->
+        erlang:send(?SERVER, {increment_cardinality, Cardinality + 1}),
+        ok
+    after
+      40000 ->
+        ok
+    end,
+    exit(terminated)
+        end),
+  ok.
