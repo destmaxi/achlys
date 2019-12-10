@@ -278,11 +278,11 @@ venom() ->
     achlys_pmod_nav_worker:run().
 
 t() ->
-    achlys_pmod_temp_worker:run().
+    achlys_pmod_processing_worker:run().
 
 ta() ->
   fun() ->
-    achlys_pmod_temp_worker:run()
+    achlys_pmod_processing_worker:run()
   end.
 
 %% @doc Collect data based on sensors available on Pmod modules and store

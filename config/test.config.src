@@ -14,9 +14,11 @@
             cleaning => true
         }
     },
-    {temperature_worker, #{
+    {processing_worker, #{
         poll_interval => 6000,
-        aggregation_trigger => 3
+        aggregation_trigger => 3,
+        timeout => 40000,
+        collect => [temperature, pressure, accelerometry, gyroscopy, magnetic_field, light]
 
     }},
     {initial_tasks, venom},
