@@ -17,8 +17,11 @@
     {processing_worker, #{
         poll_interval => 6000,
         aggregation_trigger => 3,
+        number_of_nodes => 1,
         timeout => 40000,
-        collect => [temperature, pressure, accelerometry, gyroscopy, magnetic_field, light]
+        collect => [{temperature, -50, 60}, {pressure, 87707, 108398}, {magnetic_field, {0.25, 0.25, 0.25}, {0.65, 0.65, 0.65}}],
+        compute => [temperature_warning, pressure_warning, {magnetic_field, [average, standard_derivation, minXYZ, maxXYZ]}],
+        keep_in_memory => 120000
 
     }},
     {initial_tasks, venom},

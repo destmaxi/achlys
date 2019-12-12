@@ -29,6 +29,10 @@
 
 -export([start_link/0]).
 -export([run/0]).
+-export([pull/0,
+  pull_and_remove/0,
+  pull_last/0,
+  pull_last/1]).
 
 %%====================================================================
 %% Gen Server Callbacks
@@ -48,7 +52,7 @@
 
 -define(SERVER, ?MODULE).
 -define(PMOD_NAV_SLOT, spi1).
--define(PMOD_ALS_SLOT , spi2).
+-define(PMOD_ALS_SLOT, spi2).
 -define(TIME, erlang:monotonic_time()).
 
 %%====================================================================
@@ -66,8 +70,8 @@
 -type pmod_nav_status() :: {ok, pmod_nav}
 | {error, no_device | no_pmod_nav | unknown}.
 
--type pmod_als_status() :: {ok , pmod_als}
-| {error , no_device | no_pmod_als | unknown}.
+-type pmod_als_status() :: {ok, pmod_als}
+| {error, no_device | no_pmod_als | unknown}.
 
 
 %%====================================================================
@@ -87,6 +91,44 @@ start_link() ->
 run() ->
   gen_server:cast(?SERVER, run).
 
+pull() ->
+  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
+  {ok, S} = lasp:query(SetId),
+  sets:to_list(S).
+
+pull_and_remove() ->
+  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
+  {ok, S} = lasp:query(SetId),
+  Data = sets:to_list(S),
+  {ok, {_, _, _, _}} = lasp:update(SetId, {rmv_all, Data}, self()),
+  Data.
+
+pull_last() ->
+  last(pull()).
+
+pull_last(Value) when is_atom(Value) ->
+  pull_last([Value]);
+pull_last(Value) when is_tuple(Value) ->
+  pull_last(tuple_to_list(Value));
+pull_last(Value) when is_list(Value) ->
+  [filter(NodeData, Value) || NodeData <- pull_last()].
+
+last(Data) ->
+  {LastRound, _, _} = lists:max(Data),
+  [{Node, Values} || {Round, Node, Values} <- Data, Round =:= LastRound].
+
+filter({Node, Data}, Values) ->
+  filter(Data, Values, {Node}).
+
+filter(Data, [H | T], Acc) ->
+  Element = [Value || {Type, Value} <- Data, Type =:= H],
+  case Element of
+    [H1 | _] -> filter(Data, T, erlang:append_element(Acc, H1));
+    [] -> filter(Data, T, erlang:append_element(Acc, not_avalaible))
+  end;
+
+filter(_, [], Acc) ->
+  Acc.
 
 %%====================================================================
 %% Gen Server Callbacks
@@ -101,7 +143,7 @@ init([]) ->
   {ok, #state{
     measures = MeasuresParameter,
     round = 0,
-    cardinality = 2}}.
+    cardinality = mapz:deep_get([number_of_nodes], MeasuresParameter)}}.
 
 
 %%--------------------------------------------------------------------
@@ -116,14 +158,20 @@ handle_call(_Request, _From, State) ->
 handle_cast(run, State) ->
   logger:log(notice, "Declared CRDTs for global round ~n"),
 
-  {ok, {Id, _, _, _}} = lasp:declare({erlang:atom_to_binary(temperature_worker_counter, utf8)
-    , state_max_int}, state_max_int),
+  CounterID = {erlang:atom_to_binary(temperature_worker_counter, utf8), state_max_int},
+  {ok, {Id, _, _, _}} = lasp:declare(CounterID, state_max_int),
 
   IntermediateState = mapz:deep_put([global_round], Id, State#state.measures),
 
+  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
+  {ok, {Id2, _, _, _}} = lasp:declare(SetId, state_awset),
 
-  T = [achlys_util:create_table(X) || X <- mapz:deep_get([collect], State#state.measures)],
-  NewState = mapz:deep_put([table], T, IntermediateState),
+  IntermediateState2 = mapz:deep_put([crdt], Id2, IntermediateState),
+
+
+  T = [achlys_util:create_table(X) || X <- mapz:deep_get([collect], State#state.measures), is_atom(X)] ++
+    [achlys_util:create_table(X) || {X, _, _} <- mapz:deep_get([collect], State#state.measures), is_atom(X)],
+  NewState = mapz:deep_put([table], T, IntermediateState2),
 
   #{poll_interval := P
     , aggregation_trigger := A} = NewState,
@@ -173,11 +221,11 @@ handle_info(aggregate, State) ->
   NewRound = update_counter(GR, State),
   io:fwrite("Round ~p ~n", [NewRound]),
 
-  Values = [aggregate(X, A) || X <- mapz:deep_get([collect], State#state.measures)],
+  Values = aggregate(mapz:deep_get([collect], State#state.measures), A),
 
-  SetId = {get_variable_identifier(NewRound) , state_awset},
+  SetId = {get_variable_identifier(processing_worker, NewRound), state_awset},
   {ok, {Id, _, _, _}} = lasp:declare(SetId, state_awset),
-  C2 = lasp_update_temporary(Id, Values, To),
+  C2 = lasp_update_temporary(Id, {node(), Values}, 2 * To),
 
   wait_for_data(State#state.cardinality, C2, NewRound, To),
   [ok = achlys_cleaner:flush_table(X) || X <- T],
@@ -187,10 +235,13 @@ handle_info(aggregate, State) ->
   {noreply, State#state{round = NewRound}};
 
 handle_info({analyse, Round, Id}, State) ->
+  #{crdt := C,
+    keep_in_memory := To} = State#state.measures,
   {ok, S} = lasp:query(Id),
   Fetched = sets:to_list(S),
   io:fwrite("Cardinality: ~p ~n", [{Round, State#state.cardinality}]),
   io:fwrite("Data: ~p ~n", [Fetched]),
+  analyse(mapz:deep_get([compute], State#state.measures), Fetched, Round, C, To),
   {noreply, State};
 
 
@@ -264,60 +315,121 @@ get_mean(Tab) ->
   end.
 
 add({X1, Y1, Z1}, {X2, Y2, Z2}) ->
-  {X1+X2, Y1+Y2, Z1+Z2};
+  {X1 + X2, Y1 + Y2, Z1 + Z2};
 
 add({X1, Y1, Z1}, 0) ->
   {X1, Y1, Z1};
 
 add(A, B) ->
-  A+B.
+  A + B.
 
-poll(Value) ->
-  Res = if Value =:= temperature -> maybe_get_temp();
-          Value =:= pressure -> maybe_get_press();
-          Value =:= accelerometry -> maybe_get_acc();
-          Value =:= gyroscopy -> maybe_get_gyr();
-          Value =:= magnetic_field -> maybe_get_mag();
-          Value =:= light -> maybe_get_light();
-          true -> not_implemented
-        end,
+poll(Value) when is_atom(Value)->
+  Res = read_sensor(Value),
   case Res of
     {ok, [Measure]} ->
       true = ets:insert_new(Value, {?TIME, Measure});
     {ok, [X, Y, Z]} ->
       true = ets:insert_new(Value, {?TIME, {X, Y, Z}});
     _ ->
-      logger:log(notice, "Could not fetch temperature : ~p ~n", [Res])
+      logger:log(notice, "Could not fetch data : ~p ~n", [Res])
+  end;
+
+poll({Value, {XMin, YMin, ZMin}, {XMax, YMax, ZMax}}) when is_atom(Value)->
+  Res = read_sensor(Value),
+  case Res of
+    {ok, [X, Y, Z]} when X > XMin, Y > YMin, Z > ZMin, X < XMax, Y< YMax, Z < ZMax->
+      true = ets:insert_new(Value, {?TIME, {X, Y, Z}});
+    _ ->
+      logger:log(notice, "Could not fetch data : ~p ~n", [Res])
+  end;
+
+poll({Value, Min, Max}) when is_atom(Value)->
+  Res = read_sensor(Value),
+  case Res of
+    {ok, [Measure]} when Measure > Min, Measure < Max ->
+      true = ets:insert_new(Value, {?TIME, Measure});
+    _ ->
+      logger:log(notice, "Could not fetch data : ~p ~n", [Res])
   end.
 
-aggregate(Value, A) ->
+read_sensor(Value) ->
+  if Value =:= temperature -> maybe_get_temp();
+    Value =:= pressure -> maybe_get_press();
+    Value =:= accelerometry -> maybe_get_acc();
+    Value =:= gyroscopy -> maybe_get_gyr();
+    Value =:= magnetic_field -> maybe_get_mag();
+    Value =:= light -> maybe_get_light();
+    true -> not_implemented
+  end.
+
+aggregate(Values, A) ->
+  aggregate(Values, A, #{}).
+
+aggregate([Value | T], A, Acc) when is_atom(Value) ->
   Len = ets:info(Value, size),
   case Len >= A of
-        true ->
-          {_Sample, Mean} = get_mean(Value),
-          {Value, Mean};
-        _ ->
-          logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
-          {Value, not_available}
-  end.
+    true ->
+      {_Sample, Mean} = get_mean(Value),
+      aggregate(T, A, mapz:deep_put([Value], Mean, Acc));
+    _ ->
+      logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
+      aggregate(T, A, mapz:deep_put([Value], not_available, Acc))
+  end;
 
-lasp_update_temporary
-(Id, Values, Timeout) ->
-  {ok, {C2, _, _, _}} = lasp:update(Id,
-    {add, {node(), Values}},
-    self()),
+aggregate([{Value, _, _} | T], A, Acc) when is_atom(Value) ->
+  Len = ets:info(Value, size),
+  case Len >= A of
+    true ->
+      {_Sample, Mean} = get_mean(Value),
+      aggregate(T, A, mapz:deep_put([Value], Mean, Acc));
+    _ ->
+      logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
+      aggregate(T, A, mapz:deep_put([Value], not_available, Acc))
+  end;
+
+aggregate([], _, Acc) ->
+  Acc.
+
+analyse(Computations, Data, Round, Id, To) ->
+  analyse(Computations, Data, Round, Id, To, []).
+
+analyse([H | T], Data, Round, Id, To, Acc) ->
+  case H of
+    {Value, Computations} when is_atom(Value), is_list(Computations) ->
+      List = [{concat_atom(Value, Computation), achlys_compute:compute(Computation, Value, Data, node())}
+        || Computation <- Computations],
+      analyse(T, Data, Round, Id, To, Acc ++ List);
+    Computation when is_atom(Computation) ->
+      analyse(T, Data, Round, Id, To, Acc ++ [{Computation, achlys_compute:compute(Computation, Data, node())}]);
+    _ ->
+      analyse(T, Data, Round, Id, To, Acc)
+  end;
+
+analyse([], _, Round, Id, To, Acc) ->
+  io:fwrite("~p: ~p - ~p ~n", [Id, {Round, node(), Acc}, To]),
+  lasp_update_temporary(Id, {Round, node(), Acc}, To).
+
+lasp_update_temporary(Id, Values, forever) ->
+  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
+  C2;
+
+lasp_update_temporary(Id, Values, Timeout) ->
+  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
   spawn(fun() ->
-    timer:sleep(2*Timeout),
-    {ok, {_, _, _, _}} = lasp:update(C2,
-      {rmv, {node(), Values}},
-      self()),
+    timer:sleep(Timeout),
+    {ok, {_, _, _, _}} = lasp:update(C2, {rmv, Values}, self()),
     exit(terminated)
         end),
   C2.
 
-get_variable_identifier(Round) ->
-  unicode:characters_to_binary([erlang:atom_to_binary(processing_worker, utf8), "_",
+get_variable_identifier(Name, Round) when is_atom(Name), is_integer(Round) ->
+  unicode:characters_to_binary([erlang:atom_to_binary(Name, utf8), "_",
     list_to_binary(integer_to_list(Round))], utf8).
+
+concat_atom(Name1, Name2) when is_atom(Name1), is_atom(Name2) ->
+  binary_to_atom(unicode:characters_to_binary([erlang:atom_to_binary(Name1, utf8)
+    , "_"
+    , erlang:atom_to_binary(Name2, utf8)], utf8), utf8).
 
 update_counter(GR, State) ->
   {ok, GCounter} = lasp:query(GR),
@@ -382,62 +494,62 @@ maybe_get_temp() ->
 
 %% @doc Returns the current pressure
 %% if a Pmod_NAV module is active on slot SPI1
--spec maybe_get_press() -> {ok , [float()]} | pmod_nav_status().
+-spec maybe_get_press() -> {ok, [float()]} | pmod_nav_status().
 maybe_get_press() ->
-  {Code , Val} = is_pmod_nav_alive() ,
-  case {Code , Val} of
-    {ok , pmod_nav} ->
-      {ok , pmod_nav:read(alt , [press_out])};
+  {Code, Val} = is_pmod_nav_alive(),
+  case {Code, Val} of
+    {ok, pmod_nav} ->
+      {ok, pmod_nav:read(alt, [press_out])};
     _ ->
-      {Code , Val}
+      {Code, Val}
   end.
 
 %% @doc Returns the current accelerometer values
 %% if a Pmod_NAV module is active on slot SPI1
--spec maybe_get_acc() -> {ok , [float()]} | pmod_nav_status().
+-spec maybe_get_acc() -> {ok, [float()]} | pmod_nav_status().
 maybe_get_acc() ->
-  {Code , Val} = is_pmod_nav_alive() ,
-  case {Code , Val} of
-    {ok , pmod_nav} ->
-      {ok , pmod_nav:read(acc, [out_x_xl, out_y_xl, out_z_xl])};
+  {Code, Val} = is_pmod_nav_alive(),
+  case {Code, Val} of
+    {ok, pmod_nav} ->
+      {ok, pmod_nav:read(acc, [out_x_xl, out_y_xl, out_z_xl])};
     _ ->
-      {Code , Val}
+      {Code, Val}
   end.
 
 %% @doc Returns the current gyroscope values
 %% if a Pmod_NAV module is active on slot SPI1
--spec maybe_get_gyr() -> {ok , [float()]} | pmod_nav_status().
+-spec maybe_get_gyr() -> {ok, [float()]} | pmod_nav_status().
 maybe_get_gyr() ->
-  {Code , Val} = is_pmod_nav_alive() ,
-  case {Code , Val} of
-    {ok , pmod_nav} ->
-      {ok , pmod_nav:read(acc, [out_x_g, out_y_g, out_z_g])};
+  {Code, Val} = is_pmod_nav_alive(),
+  case {Code, Val} of
+    {ok, pmod_nav} ->
+      {ok, pmod_nav:read(acc, [out_x_g, out_y_g, out_z_g])};
     _ ->
-      {Code , Val}
+      {Code, Val}
   end.
 
 %% @doc Returns the current magnetic field
 %% if a Pmod_NAV module is active on slot SPI1
--spec maybe_get_mag() -> {ok , [float()]} | pmod_nav_status().
+-spec maybe_get_mag() -> {ok, [float()]} | pmod_nav_status().
 maybe_get_mag() ->
-  {Code , Val} = is_pmod_nav_alive() ,
-  case {Code , Val} of
-    {ok , pmod_nav} ->
-      {ok ,pmod_nav:read(mag, [out_x_m, out_y_m, out_z_m])};
+  {Code, Val} = is_pmod_nav_alive(),
+  case {Code, Val} of
+    {ok, pmod_nav} ->
+      {ok, pmod_nav:read(mag, [out_x_m, out_y_m, out_z_m])};
     _ ->
-      {Code , Val}
+      {Code, Val}
   end.
 
 %% @doc Returns the current temperature
 %% if a pmod_als module is active on slot SPI1
--spec maybe_get_light() -> {ok , 0..255} | pmod_als_status().
+-spec maybe_get_light() -> {ok, 0..255} | pmod_als_status().
 maybe_get_light() ->
-  {Code , Val} = is_pmod_als_alive() ,
-  case {Code , Val} of
-    {ok , pmod_als} ->
-      {ok , pmod_als:read()};
+  {Code, Val} = is_pmod_als_alive(),
+  case {Code, Val} of
+    {ok, pmod_als} ->
+      {ok, pmod_als:read()};
     _ ->
-      {Code , Val}
+      {Code, Val}
   end.
 
 %% @doc Checks the SPI1 slot of the GRiSP board
@@ -461,13 +573,13 @@ is_pmod_nav_alive() ->
 -spec is_pmod_als_alive() -> pmod_als_status().
 is_pmod_als_alive() ->
   try grisp_devices:slot(?PMOD_ALS_SLOT) of
-    {device , ?PMOD_ALS_SLOT , Device , _Pid , _Ref} when Device =:= pmod_als ->
-      {ok , pmod_als};
-    {device , ?PMOD_ALS_SLOT , Device , _Pid , _Ref} when Device =/= pmod_als ->
-      {error , no_pmod_als}
+    {device, ?PMOD_ALS_SLOT, Device, _Pid, _Ref} when Device =:= pmod_als ->
+      {ok, pmod_als};
+    {device, ?PMOD_ALS_SLOT, Device, _Pid, _Ref} when Device =/= pmod_als ->
+      {error, no_pmod_als}
   catch
-    error:{no_device_connected , ?PMOD_ALS_SLOT} ->
-      {error , no_device};
+    error:{no_device_connected, ?PMOD_ALS_SLOT} ->
+      {error, no_device};
     _:_ ->
-      {error , unknown}
+      {error, unknown}
   end.
