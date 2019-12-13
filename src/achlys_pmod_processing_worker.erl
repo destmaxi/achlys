@@ -1,8 +1,8 @@
 %%%-------------------------------------------------------------------
 %%% @author Maxime De Streel, Benjamin Simon
-%%% @doc The Pmod_temp worker server.
+%%% @doc The Pmod_processing worker server.
 %%% The general purpose of this worker is to gather
-%%% and process sensor data from the temperature sensor.
+%%% and process sensor data from sensor and to process them.
 %%%
 %%%   Data can be retrieved as follows :
 %%%
@@ -73,13 +73,19 @@
 -type pmod_als_status() :: {ok, pmod_als}
 | {error, no_device | no_pmod_als | unknown}.
 
+-type coordinate() :: {number(), number(), number()}.
+
+-type lasp_id() :: {binary(), atom()}.
+
+-type my_timeout() :: forever | pos_integer().
+
 
 %%====================================================================
 %% API
 %%====================================================================
 
-% @doc starts the pmod_temp process using the configuration
-% given in the sys.config file.
+%% @doc starts the pmod_temp process using the configuration
+%% given in the sys.config file.
 -spec start_link() ->
   {ok, pid()} | ignore | {error, {already_started, pid()} | term()}.
 start_link() ->
@@ -91,11 +97,17 @@ start_link() ->
 run() ->
   gen_server:cast(?SERVER, run).
 
+%% @doc pull all the data processed from the Lasp variable.
+%% The data in the list are as follow: {Round, ProcessingNode, [{Element, Value}, ...]}
+-spec pull() -> list().
 pull() ->
   SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
   {ok, S} = lasp:query(SetId),
   sets:to_list(S).
 
+%% @doc pull all the data processed from the Lasp variable
+%% and remove all the elements store in this variable.
+-spec pull_and_remove() -> list().
 pull_and_remove() ->
   SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
   {ok, S} = lasp:query(SetId),
@@ -103,9 +115,15 @@ pull_and_remove() ->
   {ok, {_, _, _, _}} = lasp:update(SetId, {rmv_all, Data}, self()),
   Data.
 
+%% @doc pull the latest data processed from the Lasp variable.
+%% The data in the list are as follow: {ProcessingNode, [{ValueType, Value}, ...]}
+-spec pull_last() -> list().
 pull_last() ->
   last(pull()).
 
+%% @doc pull the latest data processed corresponding to the value type(s) in argument from the Lasp variable.
+%% The data in the list are as follow: {ProcessingNode, Value1, Value2, ...}}
+-spec pull_last(atom() | tuple() | list()) -> list().
 pull_last(Value) when is_atom(Value) ->
   pull_last([Value]);
 pull_last(Value) when is_tuple(Value) ->
@@ -113,22 +131,6 @@ pull_last(Value) when is_tuple(Value) ->
 pull_last(Value) when is_list(Value) ->
   [filter(NodeData, Value) || NodeData <- pull_last()].
 
-last(Data) ->
-  {LastRound, _, _} = lists:max(Data),
-  [{Node, Values} || {Round, Node, Values} <- Data, Round =:= LastRound].
-
-filter({Node, Data}, Values) ->
-  filter(Data, Values, {Node}).
-
-filter(Data, [H | T], Acc) ->
-  Element = [Value || {Type, Value} <- Data, Type =:= H],
-  case Element of
-    [H1 | _] -> filter(Data, T, erlang:append_element(Acc, H1));
-    [] -> filter(Data, T, erlang:append_element(Acc, not_avalaible))
-  end;
-
-filter(_, [], Acc) ->
-  Acc.
 
 %%====================================================================
 %% Gen Server Callbacks
@@ -188,7 +190,7 @@ handle_cast(_Msg, State) ->
 
 %%--------------------------------------------------------------------
 
-%% @doc fetches the values from the {@link pmod_nav} temperature sensor
+%% @doc fetches the values from the {@link pmod_nav} or {@link pmod_nav} sensor
 %% and stores them in the corresponding ETS table. It is paired with
 %% the {@link erlang:monotonic_time/0} to guarantee unique keys.
 %% For large amounts of sensor data
@@ -245,16 +247,13 @@ handle_info({analyse, Round, Id}, State) ->
   {noreply, State};
 
 
-
 handle_info({increment_cardinality, NewCardinality}, State) when NewCardinality > State#state.cardinality ->
   {noreply, State#state{cardinality = NewCardinality}};
-
 handle_info({increment_cardinality, _}, State) ->
   {noreply, State};
 
 handle_info({decrement_cardinality, NewCardinality}, State) when NewCardinality < State#state.cardinality ->
   {noreply, State#state{cardinality = NewCardinality}};
-
 handle_info({decrement_cardinality, _}, State) ->
   {noreply, State};
 
@@ -296,34 +295,40 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 %%====================================================================
-%% Internal functions
+%% API Internal functions
 %%====================================================================
 
-%% @doc Returns the temperature average
-%% based on entries in the ETS table
--spec get_mean(atom() | ets:tid()) -> {number(), float()}.
-get_mean(Tab) ->
-  Sum = ets:foldl(fun
-                    (Elem, AccIn) ->
-                      {_, Temp} = Elem,
-                      add(Temp, AccIn)
-                  end, 0, Tab),
-  Len = ets:info(Tab, size),
-  case Sum of
-    {X, Y, Z} -> {Len, {(X / Len), (Y / Len), (Z / Len)}};
-    _ -> {Len, (Sum / Len)}
-  end.
+%% @doc Filtrate to only keep element with latest round and remove round
+-spec last(list()) -> list().
+last(Data) ->
+  {LastRound, _, _} = lists:max(Data),
+  [{Node, Values} || {Round, Node, Values} <- Data, Round =:= LastRound].
 
-add({X1, Y1, Z1}, {X2, Y2, Z2}) ->
-  {X1 + X2, Y1 + Y2, Z1 + Z2};
+%% @doc Return a tuple containing only the node and the values corresponding
+%% to the element of Values
+-spec filter({atom(), list()}, list()) -> tuple().
+filter({Node, Data}, Values) ->
+  filter(Data, Values, {Node}).
 
-add({X1, Y1, Z1}, 0) ->
-  {X1, Y1, Z1};
+%% @doc function with acc for the function explained before
+-spec filter({atom(), list()}, list(), tuple()) -> tuple().
+filter(Data, [H | T], Acc) ->
+  case [Value || {Type, Value} <- Data, Type =:= H] of
+    [H1 | _] -> filter(Data, T, erlang:append_element(Acc, H1));
+    [] -> filter(Data, T, erlang:append_element(Acc, not_avalaible))
+  end;
 
-add(A, B) ->
-  A + B.
+filter(_, [], Acc) ->
+  Acc.
 
-poll(Value) when is_atom(Value)->
+%%====================================================================
+%% GenServer Internal functions
+%%====================================================================
+
+%% @doc Get the value from the sensor if possible and store it.
+%% If a Min and Max values are specified, filter the value.
+-spec poll(atom() | {atom(), number()|coordinate()}) -> ok.
+poll(Value) when is_atom(Value) ->
   Res = read_sensor(Value),
   case Res of
     {ok, [Measure]} ->
@@ -332,39 +337,34 @@ poll(Value) when is_atom(Value)->
       true = ets:insert_new(Value, {?TIME, {X, Y, Z}});
     _ ->
       logger:log(notice, "Could not fetch data : ~p ~n", [Res])
-  end;
-
-poll({Value, {XMin, YMin, ZMin}, {XMax, YMax, ZMax}}) when is_atom(Value)->
+  end,
+  ok;
+poll({Value, {XMin, YMin, ZMin}, {XMax, YMax, ZMax}}) when is_atom(Value) ->
   Res = read_sensor(Value),
   case Res of
-    {ok, [X, Y, Z]} when X > XMin, Y > YMin, Z > ZMin, X < XMax, Y< YMax, Z < ZMax->
+    {ok, [X, Y, Z]} when X > XMin, Y > YMin, Z > ZMin, X < XMax, Y < YMax, Z < ZMax ->
       true = ets:insert_new(Value, {?TIME, {X, Y, Z}});
     _ ->
       logger:log(notice, "Could not fetch data : ~p ~n", [Res])
-  end;
-
-poll({Value, Min, Max}) when is_atom(Value)->
+  end,
+  ok;
+poll({Value, Min, Max}) when is_atom(Value) ->
   Res = read_sensor(Value),
   case Res of
     {ok, [Measure]} when Measure > Min, Measure < Max ->
       true = ets:insert_new(Value, {?TIME, Measure});
     _ ->
       logger:log(notice, "Could not fetch data : ~p ~n", [Res])
-  end.
+  end,
+  ok.
 
-read_sensor(Value) ->
-  if Value =:= temperature -> maybe_get_temp();
-    Value =:= pressure -> maybe_get_press();
-    Value =:= accelerometry -> maybe_get_acc();
-    Value =:= gyroscopy -> maybe_get_gyr();
-    Value =:= magnetic_field -> maybe_get_mag();
-    Value =:= light -> maybe_get_light();
-    true -> not_implemented
-  end.
-
+%% @doc Put all the mean of element in Values with enough values retrieved in a map
+-spec aggregate(list(), pos_integer()) -> map().
 aggregate(Values, A) ->
   aggregate(Values, A, #{}).
 
+%% @doc function with acc for the function explained before
+-spec aggregate(list(), pos_integer(), map()) -> map().
 aggregate([Value | T], A, Acc) when is_atom(Value) ->
   Len = ets:info(Value, size),
   case Len >= A of
@@ -375,7 +375,6 @@ aggregate([Value | T], A, Acc) when is_atom(Value) ->
       logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
       aggregate(T, A, mapz:deep_put([Value], not_available, Acc))
   end;
-
 aggregate([{Value, _, _} | T], A, Acc) when is_atom(Value) ->
   Len = ets:info(Value, size),
   case Len >= A of
@@ -386,13 +385,18 @@ aggregate([{Value, _, _} | T], A, Acc) when is_atom(Value) ->
       logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
       aggregate(T, A, mapz:deep_put([Value], not_available, Acc))
   end;
-
 aggregate([], _, Acc) ->
   Acc.
 
+%% @doc analyse the data by computing a series of values in Computations and store
+%% those processed data into a crdt variable.
+%% Store as a list of type [{Computation, Result}, ..] into the variable with name Id
+-spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout()) -> ok.
 analyse(Computations, Data, Round, Id, To) ->
   analyse(Computations, Data, Round, Id, To, []).
 
+%% @doc function with acc for the function explained before
+-spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout(), list()) -> ok.
 analyse([H | T], Data, Round, Id, To, Acc) ->
   case H of
     {Value, Computations} when is_atom(Value), is_list(Computations) ->
@@ -404,33 +408,14 @@ analyse([H | T], Data, Round, Id, To, Acc) ->
     _ ->
       analyse(T, Data, Round, Id, To, Acc)
   end;
-
 analyse([], _, Round, Id, To, Acc) ->
   io:fwrite("~p: ~p - ~p ~n", [Id, {Round, node(), Acc}, To]),
-  lasp_update_temporary(Id, {Round, node(), Acc}, To).
+  lasp_update_temporary(Id, {Round, node(), Acc}, To),
+  ok.
 
-lasp_update_temporary(Id, Values, forever) ->
-  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
-  C2;
-
-lasp_update_temporary(Id, Values, Timeout) ->
-  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
-  spawn(fun() ->
-    timer:sleep(Timeout),
-    {ok, {_, _, _, _}} = lasp:update(C2, {rmv, Values}, self()),
-    exit(terminated)
-        end),
-  C2.
-
-get_variable_identifier(Name, Round) when is_atom(Name), is_integer(Round) ->
-  unicode:characters_to_binary([erlang:atom_to_binary(Name, utf8), "_",
-    list_to_binary(integer_to_list(Round))], utf8).
-
-concat_atom(Name1, Name2) when is_atom(Name1), is_atom(Name2) ->
-  binary_to_atom(unicode:characters_to_binary([erlang:atom_to_binary(Name1, utf8)
-    , "_"
-    , erlang:atom_to_binary(Name2, utf8)], utf8), utf8).
-
+%% @doc Update both my local counter and global counter (with Id GR) if up to date
+%% or adjust local counter to the global one
+-spec update_counter(lasp_id(), pos_integer()) -> pos_integer().
 update_counter(GR, State) ->
   {ok, GCounter} = lasp:query(GR),
   if GCounter == State#state.round ->
@@ -439,7 +424,11 @@ update_counter(GR, State) ->
     true -> GCounter
   end.
 
-
+%% @doc Wait to receive cardinality data on Id.
+%% If received before Timeout try to increase the cardinality,
+%% otherwise send request to decrement cardinality.
+%% In both case send request to analyse the data from this round.
+-spec wait_for_data(pos_integer(), lasp_id(), pos_integer(), my_timeout()) -> ok.
 wait_for_data(Cardinality, Id, Round, Timeout) ->
   spawn(fun() ->
     Self = self(),
@@ -461,6 +450,9 @@ wait_for_data(Cardinality, Id, Round, Timeout) ->
         end),
   ok.
 
+%% @doc Try to increment the cardinality by waiting for cardinality + 1 data
+%% and send request to increment the cardinality if didn't timeout.
+-spec try_increase_cardinality(pos_integer(), lasp_id(), my_timeout()) -> ok.
 try_increase_cardinality(Cardinality, Id, Timeout) ->
   spawn(fun() ->
     Self = self(),
@@ -479,6 +471,83 @@ try_increase_cardinality(Cardinality, Id, Timeout) ->
         end),
   ok.
 
+%%====================================================================
+%% Util functions
+%%====================================================================
+
+%% @doc Calculate the mean of the values in the list in ets with name Tab
+%% The list is in format [{Time, Value}, ..]
+-spec get_mean(atom()) -> number()|coordinate().
+get_mean(Tab) ->
+  Sum = ets:foldl(fun
+                    (Elem, AccIn) ->
+                      {_, Temp} = Elem,
+                      add(Temp, AccIn)
+                  end, 0, Tab),
+  Len = ets:info(Tab, size),
+  case Sum of
+    {X, Y, Z} -> {Len, {(X / Len), (Y / Len), (Z / Len)}};
+    _ -> {Len, (Sum / Len)}
+  end.
+
+%% @doc Add the two element (element by element if coordinate)
+-spec add(number()|coordinate(), number()|coordinate()) -> number()|coordinate().
+add({X1, Y1, Z1}, {X2, Y2, Z2}) ->
+  {X1 + X2, Y1 + Y2, Z1 + Z2};
+add({X1, Y1, Z1}, 0) ->
+  {X1, Y1, Z1};
+add(A, B) ->
+  A + B.
+
+%%====================================================================
+%% Lasp util functions
+%%====================================================================
+
+%% @doc Add the Value to the crdt with id Id and remove it after TimeOut ms
+%% or never if Timeout is forever and return the Id
+-spec lasp_update_temporary(lasp_id(), any(), my_timeout()) -> lasp_id().
+lasp_update_temporary(Id, Value, forever) ->
+  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Value}, self()),
+  C2;
+lasp_update_temporary(Id, Values, Timeout) ->
+  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
+  spawn(fun() ->
+    timer:sleep(Timeout),
+    {ok, {_, _, _, _}} = lasp:update(C2, {rmv, Values}, self()),
+    exit(terminated)
+        end),
+  C2.
+
+%% @doc Returns the concatenation of the atom and the Round Number
+%% with a "_" in between as a binary
+-spec get_variable_identifier(atom(), pos_integer()) -> binary().
+get_variable_identifier(Name, Round) when is_atom(Name), is_integer(Round) ->
+  unicode:characters_to_binary([erlang:atom_to_binary(Name, utf8), "_",
+    list_to_binary(integer_to_list(Round))], utf8).
+
+%% @doc Returns the concatenation of the 2 atoms with a "_" in between
+-spec concat_atom(atom(), atom()) -> atom().
+concat_atom(Name1, Name2) when is_atom(Name1), is_atom(Name2) ->
+  binary_to_atom(unicode:characters_to_binary([erlang:atom_to_binary(Name1, utf8)
+    , "_"
+    , erlang:atom_to_binary(Name2, utf8)], utf8), utf8).
+
+%%====================================================================
+%% Sensor reading functions
+%%====================================================================
+
+%% @doc Returns the current value of the sensor corresponding to Value
+%% if a Pmod module is active
+-spec read_sensor(atom()) -> {ok, [float()]} | pmod_nav_status() | pmod_als_status().
+read_sensor(Value) ->
+  if Value =:= temperature -> maybe_get_temp();
+    Value =:= pressure -> maybe_get_press();
+    Value =:= accelerometry -> maybe_get_acc();
+    Value =:= gyroscopy -> maybe_get_gyr();
+    Value =:= magnetic_field -> maybe_get_mag();
+    Value =:= light -> maybe_get_light();
+    true -> not_implemented
+  end.
 
 %% @doc Returns the current temperature
 %% if a Pmod_NAV module is active on slot SPI1
