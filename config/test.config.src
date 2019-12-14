@@ -17,7 +17,7 @@
     {processing_worker, #{
         poll_interval => 6000,
         aggregation_trigger => 3,
-        number_of_nodes => 1,
+        number_of_nodes => 5,
         timeout => 40000,
         collect => [{temperature, -50, 60}, {pressure, -877, 1084}, {magnetic_field, {-0.25, -0.25, -0.25}, {0.65, 0.65, 0.65}}],
         compute => [temperature_warning, pressure_warning, {magnetic_field, [average, standard_derivation, minXYZ, maxXYZ]}],

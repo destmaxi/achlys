@@ -124,10 +124,8 @@ pull_last() ->
 %% @doc pull the latest data processed corresponding to the value type(s) in argument from the Lasp variable.
 %% The data in the list are as follow: {ProcessingNode, Value1, Value2, ...}}
 -spec pull_last(atom() | tuple() | list()) -> list().
-pull_last(Value) when is_atom(Value) ->
-  pull_last([Value]);
-pull_last(Value) when is_tuple(Value) ->
-  pull_last(tuple_to_list(Value));
+pull_last(Value) when is_atom(Value) -> pull_last([Value]);
+pull_last(Value) when is_tuple(Value) -> pull_last(tuple_to_list(Value));
 pull_last(Value) when is_list(Value) ->
   [filter(NodeData, Value) || NodeData <- pull_last()].
 
@@ -307,8 +305,7 @@ last(Data) ->
 %% @doc Return a tuple containing only the node and the values corresponding
 %% to the element of Values
 -spec filter({atom(), list()}, list()) -> tuple().
-filter({Node, Data}, Values) ->
-  filter(Data, Values, {Node}).
+filter({Node, Data}, Values) -> filter(Data, Values, {Node}).
 
 %% @doc function with acc for the function explained before
 -spec filter({atom(), list()}, list(), tuple()) -> tuple().
@@ -318,8 +315,7 @@ filter(Data, [H | T], Acc) ->
     [] -> filter(Data, T, erlang:append_element(Acc, not_avalaible))
   end;
 
-filter(_, [], Acc) ->
-  Acc.
+filter(_, [], Acc) -> Acc.
 
 %%====================================================================
 %% GenServer Internal functions
@@ -360,8 +356,7 @@ poll({Value, Min, Max}) when is_atom(Value) ->
 
 %% @doc Put all the mean of element in Values with enough values retrieved in a map
 -spec aggregate(list(), pos_integer()) -> map().
-aggregate(Values, A) ->
-  aggregate(Values, A, #{}).
+aggregate(Values, A) -> aggregate(Values, A, #{}).
 
 %% @doc function with acc for the function explained before
 -spec aggregate(list(), pos_integer(), map()) -> map().
@@ -385,15 +380,13 @@ aggregate([{Value, _, _} | T], A, Acc) when is_atom(Value) ->
       logger:log(notice, "Could not compute aggregate with ~p values ~n", [Len]),
       aggregate(T, A, mapz:deep_put([Value], not_available, Acc))
   end;
-aggregate([], _, Acc) ->
-  Acc.
+aggregate([], _, Acc) -> Acc.
 
 %% @doc analyse the data by computing a series of values in Computations and store
 %% those processed data into a crdt variable.
 %% Store as a list of type [{Computation, Result}, ..] into the variable with name Id
 -spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout()) -> ok.
-analyse(Computations, Data, Round, Id, To) ->
-  analyse(Computations, Data, Round, Id, To, []).
+analyse(Computations, Data, Round, Id, To) -> analyse(Computations, Data, Round, Id, To, []).
 
 %% @doc function with acc for the function explained before
 -spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout(), list()) -> ok.
@@ -492,12 +485,9 @@ get_mean(Tab) ->
 
 %% @doc Add the two element (element by element if coordinate)
 -spec add(number()|coordinate(), number()|coordinate()) -> number()|coordinate().
-add({X1, Y1, Z1}, {X2, Y2, Z2}) ->
-  {X1 + X2, Y1 + Y2, Z1 + Z2};
-add({X1, Y1, Z1}, 0) ->
-  {X1, Y1, Z1};
-add(A, B) ->
-  A + B.
+add({X1, Y1, Z1}, {X2, Y2, Z2}) -> {X1 + X2, Y1 + Y2, Z1 + Z2};
+add({X1, Y1, Z1}, 0) -> {X1, Y1, Z1};
+add(A, B) -> A + B.
 
 %%====================================================================
 %% Lasp util functions
