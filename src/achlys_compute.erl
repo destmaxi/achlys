@@ -134,10 +134,8 @@ retrieve(RawData, Value) when is_atom(Value) ->
 
 %% @doc take a list of data for a node and the element from Value wanted and
 %% return the value wanted.
--spec retrieve(list({atom(), map()}), atom()|list()|tuple()) -> tuple().
 extract_data_from_node({Node, NodeData}, Collect) ->
   extract_data_from_node(NodeData, Collect, {Node}).
--spec retrieve(list({atom(), map()}), atom()|list()|tuple()) -> tuple().
 %% @doc function with acc for the function explained before
 extract_data_from_node(NodeData, [H | T], Acc) ->
   extract_data_from_node(NodeData, T, erlang:append_element(Acc, mapz:deep_get([H], NodeData, not_avalaible)));

@@ -196,7 +196,7 @@ mintemp() ->
         Name = node(),
         lasp:update(Id, {add, {Min, Name}}, self()),
         spawn(fun() ->
-                lasp:read(Id, {cardinality, 5}),
+                lasp:read(Id, {cardinality, 2}),
                 {ok, S} = lasp:query(Id),
                 Fetched = sets:to_list(S),
                 {Minimum, Node} = hd(lists:usort(Fetched)),
