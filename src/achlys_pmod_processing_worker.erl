@@ -30,7 +30,6 @@
 -export([start_link/0]).
 -export([run/0]).
 -export([pull/0,
-  pull_and_remove/0,
   pull_last/0,
   pull_last/1]).
 
@@ -44,7 +43,9 @@
   handle_info/2,
   handle_continue/2,
   terminate/2,
-  code_change/3]).
+  code_change/3,
+  get_variable_identifier/2,
+  concat_atom/2]).
 
 %%====================================================================
 %% Macros
@@ -101,19 +102,8 @@ run() ->
 %% The data in the list are as follow: {Round, ProcessingNode, [{Element, Value}, ...]}
 -spec pull() -> list().
 pull() ->
-  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
-  {ok, S} = lasp:query(SetId),
-  sets:to_list(S).
-
-%% @doc pull all the data processed from the Lasp variable
-%% and remove all the elements store in this variable.
--spec pull_and_remove() -> list().
-pull_and_remove() ->
-  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
-  {ok, S} = lasp:query(SetId),
-  Data = sets:to_list(S),
-  {ok, {_, _, _, _}} = lasp:update(SetId, {rmv_all, Data}, self()),
-  Data.
+  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_gset},
+  lasp_read(SetId).
 
 %% @doc pull the latest data processed from the Lasp variable.
 %% The data in the list are as follow: {ProcessingNode, [{ValueType, Value}, ...]}
@@ -163,8 +153,8 @@ handle_cast(run, State) ->
 
   IntermediateState = mapz:deep_put([global_round], Id, State#state.measures),
 
-  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_awset},
-  {ok, {Id2, _, _, _}} = lasp:declare(SetId, state_awset),
+  SetId = {erlang:atom_to_binary(analysed_data, utf8), state_gset},
+  {ok, {Id2, _, _, _}} = lasp:declare(SetId, state_gset),
 
   IntermediateState2 = mapz:deep_put([crdt], Id2, IntermediateState),
 
@@ -223,9 +213,9 @@ handle_info(aggregate, State) ->
 
   Values = aggregate(mapz:deep_get([collect], State#state.measures), A),
 
-  SetId = {get_variable_identifier(processing_worker, NewRound), state_awset},
-  {ok, {Id, _, _, _}} = lasp:declare(SetId, state_awset),
-  C2 = lasp_update_temporary(Id, {node(), Values}, 2 * To),
+  SetId = {get_variable_identifier(processing_worker, NewRound), state_gset},
+  {ok, {Id, _, _, _}} = lasp:declare(SetId, state_gset),
+  C2 = lasp_update(Id, {node(), Values}),
 
   wait_for_data(State#state.cardinality, C2, NewRound, To),
   [ok = achlys_cleaner:flush_table(X) || X <- T],
@@ -235,13 +225,11 @@ handle_info(aggregate, State) ->
   {noreply, State#state{round = NewRound}};
 
 handle_info({analyse, Round, Id}, State) ->
-  #{crdt := C,
-    keep_in_memory := To} = State#state.measures,
-  {ok, S} = lasp:query(Id),
-  Fetched = sets:to_list(S),
+  #{crdt := C} = State#state.measures,
+  Fetched = lasp_read(Id),
   io:fwrite("Cardinality: ~p ~n", [{Round, State#state.cardinality}]),
   io:fwrite("Data: ~p ~n", [Fetched]),
-  analyse(mapz:deep_get([compute], State#state.measures), Fetched, Round, C, To),
+  analyse(mapz:deep_get([compute], State#state.measures), Fetched, Round, C),
   {noreply, State};
 
 
@@ -385,25 +373,25 @@ aggregate([], _, Acc) -> Acc.
 %% @doc analyse the data by computing a series of values in Computations and store
 %% those processed data into a crdt variable.
 %% Store as a list of type [{Computation, Result}, ..] into the variable with name Id
--spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout()) -> ok.
-analyse(Computations, Data, Round, Id, To) -> analyse(Computations, Data, Round, Id, To, []).
+-spec analyse(list(), list(), pos_integer(), lasp_id()) -> ok.
+analyse(Computations, Data, Round, Id) -> analyse(Computations, Data, Round, Id, []).
 
 %% @doc function with acc for the function explained before
--spec analyse(list(), list(), pos_integer(), lasp_id(), my_timeout(), list()) -> ok.
-analyse([H | T], Data, Round, Id, To, Acc) ->
+-spec analyse(list(), list(), pos_integer(), lasp_id(),  list()) -> ok.
+analyse([H | T], Data, Round, Id, Acc) ->
   case H of
     {Value, Computations} when is_atom(Value), is_list(Computations) ->
       List = [{concat_atom(Value, Computation), achlys_compute:compute(Computation, Value, Data, node())}
         || Computation <- Computations],
-      analyse(T, Data, Round, Id, To, Acc ++ List);
+      analyse(T, Data, Round, Id, Acc ++ List);
     Computation when is_atom(Computation) ->
-      analyse(T, Data, Round, Id, To, Acc ++ [{Computation, achlys_compute:compute(Computation, Data, node())}]);
+      analyse(T, Data, Round, Id, Acc ++ [{Computation, achlys_compute:compute(Computation, Data, node())}]);
     _ ->
-      analyse(T, Data, Round, Id, To, Acc)
+      analyse(T, Data, Round, Id, Acc)
   end;
-analyse([], _, Round, Id, To, Acc) ->
-  io:fwrite("~p: ~p - ~p ~n", [Id, {Round, node(), Acc}, To]),
-  lasp_update_temporary(Id, {Round, node(), Acc}, To),
+analyse([], _, Round, Id, Acc) ->
+  io:fwrite("~p: ~p ~n", [Id, {Round, node(), Acc}]),
+  lasp_update(Id, {Round, node(), Acc}),
   ok.
 
 %% @doc Update both my local counter and global counter (with Id GR) if up to date
@@ -495,32 +483,37 @@ add(A, B) -> A + B.
 
 %% @doc Add the Value to the crdt with id Id and remove it after TimeOut ms
 %% or never if Timeout is forever and return the Id
--spec lasp_update_temporary(lasp_id(), any(), my_timeout()) -> lasp_id().
-lasp_update_temporary(Id, Value, forever) ->
-  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Value}, self()),
-  C2;
-lasp_update_temporary(Id, Values, Timeout) ->
-  {ok, {C2, _, _, _}} = lasp:update(Id, {add, Values}, self()),
-  spawn(fun() ->
-    timer:sleep(Timeout),
-    {ok, {_, _, _, _}} = lasp:update(C2, {rmv, Values}, self()),
-    exit(terminated)
-        end),
+-spec lasp_update(lasp_id(), any()) -> lasp_id().
+lasp_update(Id, Value) ->
+  {ok, {C2, _, _, _}} = lasp:update(Id, {add, do_encode(Value)}, self()),
   C2.
+
+lasp_read(Id) ->
+  {ok, S} = lasp:query(Id),
+  [do_decode(X) || X <-sets:to_list(S)].
 
 %% @doc Returns the concatenation of the atom and the Round Number
 %% with a "_" in between as a binary
 -spec get_variable_identifier(atom(), pos_integer()) -> binary().
 get_variable_identifier(Name, Round) when is_atom(Name), is_integer(Round) ->
-  unicode:characters_to_binary([erlang:atom_to_binary(Name, utf8), "_",
-    list_to_binary(integer_to_list(Round))], utf8).
+  B1 = erlang:atom_to_binary(Name, utf8),
+  B2 = <<"_">>,
+  B3 = erlang:integer_to_binary(Round),
+  <<B1/binary, B2/binary, B3/binary>>.
 
 %% @doc Returns the concatenation of the 2 atoms with a "_" in between
 -spec concat_atom(atom(), atom()) -> atom().
 concat_atom(Name1, Name2) when is_atom(Name1), is_atom(Name2) ->
-  binary_to_atom(unicode:characters_to_binary([erlang:atom_to_binary(Name1, utf8)
-    , "_"
-    , erlang:atom_to_binary(Name2, utf8)], utf8), utf8).
+  list_to_atom(atom_to_list(Name1) ++ "_" ++ atom_to_list(Name2)).
+
+
+-spec do_encode(Term :: term()) -> binary().
+do_encode(Term) ->
+  erlang:term_to_binary(Term, [{compressed, 9}]).
+
+-spec do_decode(Bin :: binary()) -> term().
+do_decode(Bin) ->
+  erlang:binary_to_term(Bin).
 
 %%====================================================================
 %% Sensor reading functions
